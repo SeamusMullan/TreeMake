@@ -329,7 +329,8 @@ static void DrawUI(AppState& st) {
         auto it = st.tree.find(kind);
         if (it == st.tree.end() || it->second.empty()) continue;
 
-        if (ImGui::TreeNodeEx(KindLabel(kind), ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::TreeNodeEx((std::string(KindLabel(kind)) + "##cat" + std::to_string((int)kind)).c_str(),
+                               ImGuiTreeNodeFlags_DefaultOpen)) {
             for (auto& name : it->second) {
                 auto& p = st.presets[name];
                 if (p.hidden && !st.showHidden) continue;
@@ -340,7 +341,8 @@ static void DrawUI(AppState& st) {
 
                 if (p.hidden) ImGui::PushStyleColor(ImGuiCol_Text, {0.5f, 0.5f, 0.5f, 1.0f});
 
-                std::string label = p.displayName.empty() ? name : p.displayName + "  (" + name + ")";
+                std::string label = (p.displayName.empty() ? name : p.displayName + "  (" + name + ")")
+                                    + "##" + name;
                 ImGui::TreeNodeEx(label.c_str(), flags);
 
                 if (ImGui::IsItemClicked()) {
@@ -452,3 +454,16 @@ int main(int argc, char* argv[]) {
     glfwTerminate();
     return 0;
 }
+
+#ifdef _WIN32
+#include <windows.h>
+int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR lpCmdLine, int) {
+    int argc = 1;
+    char* argv[2] = { (char*)"preset_viewer", nullptr };
+    if (lpCmdLine && lpCmdLine[0]) {
+        argv[1] = lpCmdLine;
+        argc = 2;
+    }
+    return main(argc, argv);
+}
+#endif

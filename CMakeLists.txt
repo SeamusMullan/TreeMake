@@ -56,3 +56,6 @@ find_package(OpenGL REQUIRED)
 # ── Our app ───────────────────────────────────────────────────
 add_executable(preset_viewer src/main.cpp)
 target_link_libraries(preset_viewer PRIVATE imgui OpenGL::GL nlohmann_json::nlohmann_json)
+
+# Hide the console window on Windows
+set_target_properties(preset_viewer PROPERTIES WIN32_EXECUTABLE $<BOOL:$<PLATFORM_ID:Windows>>)
