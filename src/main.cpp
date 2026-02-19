@@ -6,11 +6,12 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <map>
-#include <optional>
+#include <queue>
 #include <set>
 #include <string>
 #include <vector>
@@ -18,19 +19,32 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-// ─── Data types ──────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+//  Data types
+// ═══════════════════════════════════════════════════════════════
 
 enum class PresetKind { Configure, Build, Test, Package, Workflow };
 
 static const char* KindLabel(PresetKind k) {
     switch (k) {
-        case PresetKind::Configure: return "Configure Presets";
-        case PresetKind::Build:     return "Build Presets";
-        case PresetKind::Test:      return "Test Presets";
-        case PresetKind::Package:   return "Package Presets";
-        case PresetKind::Workflow:  return "Workflow Presets";
+        case PresetKind::Configure: return "Configure";
+        case PresetKind::Build:     return "Build";
+        case PresetKind::Test:      return "Test";
+        case PresetKind::Package:   return "Package";
+        case PresetKind::Workflow:  return "Workflow";
     }
     return "?";
+}
+
+static ImU32 KindColor(PresetKind k) {
+    switch (k) {
+        case PresetKind::Configure: return IM_COL32(100, 160, 255, 255);
+        case PresetKind::Build:     return IM_COL32(100, 220, 130, 255);
+        case PresetKind::Test:      return IM_COL32(240, 180,  80, 255);
+        case PresetKind::Package:   return IM_COL32(220, 120, 220, 255);
+        case PresetKind::Workflow:  return IM_COL32(220, 100, 100, 255);
+    }
+    return IM_COL32(180, 180, 180, 255);
 }
 
 struct Preset {
@@ -39,43 +53,54 @@ struct Preset {
     PresetKind               kind;
     bool                     hidden = false;
     std::vector<std::string> inherits;
+    std::string              sourceFile;
 
-    // Raw fields straight from JSON
     std::string generator;
     std::string binaryDir;
     std::string installDir;
     std::string toolchainFile;
-    std::string configurePreset;   // for build/test presets
-    std::string configuration;     // for build presets
+    std::string configurePreset;
+    std::string configuration;
     std::map<std::string, std::string> cacheVariables;
-    json        rawJson;           // keep full JSON for anything we don't model
+    json        rawJson;
 };
 
-// ─── Application state ──────────────────────────────────────
+struct GraphNode {
+    std::string name;
+    ImVec2      pos  = {0, 0};
+    ImVec2      size = {200, 40};
+};
 
 struct AppState {
     std::string                          filePath;
     std::string                          errorMsg;
     int                                  version = 0;
-    std::map<std::string, Preset>        presets;           // name -> preset
-    std::map<PresetKind, std::vector<std::string>> tree;    // kind -> ordered names
-    std::string                          selected;          // currently selected preset name
-    std::string                          resolvedText;      // cached resolved text
+    std::map<std::string, Preset>        presets;
+    std::map<PresetKind, std::vector<std::string>> tree;
+    std::string                          selected;
+    std::string                          resolvedText;
     char                                 pathBuf[1024] = {};
     bool                                 showHidden = false;
+    int                                  activeTab = 0;
+
+    // Graph
+    std::map<std::string, GraphNode>     graphNodes;
+    ImVec2                               graphScroll = {0, 0};
+    float                                graphZoom = 1.0f;
+    bool                                 graphLayoutDone = false;
+    std::string                          graphDragging;
 };
 
-// ─── Parsing helpers ─────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+//  JSON helpers
+// ═══════════════════════════════════════════════════════════════
 
 static std::vector<std::string> GetInherits(const json& j) {
     std::vector<std::string> out;
     if (!j.contains("inherits")) return out;
     auto& v = j["inherits"];
-    if (v.is_string()) {
-        out.push_back(v.get<std::string>());
-    } else if (v.is_array()) {
-        for (auto& e : v) out.push_back(e.get<std::string>());
-    }
+    if (v.is_string())     out.push_back(v.get<std::string>());
+    else if (v.is_array()) for (auto& e : v) out.push_back(e.get<std::string>());
     return out;
 }
 
@@ -86,11 +111,8 @@ static std::map<std::string, std::string> GetCacheVars(const json& j) {
         if (v.is_string()) {
             out[k] = v.get<std::string>();
         } else if (v.is_object() && v.contains("value")) {
-            // { "type": "BOOL", "value": "ON" } form
-            std::string val = v["value"].is_string() ? v["value"].get<std::string>()
-                                                      : v["value"].dump();
-            if (v.contains("type"))
-                val += "  [" + v["type"].get<std::string>() + "]";
+            std::string val = v["value"].is_string() ? v["value"].get<std::string>() : v["value"].dump();
+            if (v.contains("type")) val += "  [" + v["type"].get<std::string>() + "]";
             out[k] = val;
         } else {
             out[k] = v.dump();
@@ -104,27 +126,84 @@ static std::string JStr(const json& j, const char* key) {
     return {};
 }
 
-static void ParsePresets(const json& arr, PresetKind kind, AppState& st) {
-    for (auto& p : arr) {
-        Preset pr;
-        pr.name          = JStr(p, "name");
-        pr.displayName   = JStr(p, "displayName");
-        pr.kind          = kind;
-        pr.hidden        = p.value("hidden", false);
-        pr.inherits      = GetInherits(p);
-        pr.generator     = JStr(p, "generator");
-        pr.binaryDir     = JStr(p, "binaryDir");
-        pr.installDir    = JStr(p, "installDir");
-        pr.toolchainFile = JStr(p, "toolchainFile");
-        pr.configurePreset = JStr(p, "configurePreset");
-        pr.configuration = JStr(p, "configuration");
-        pr.cacheVariables = GetCacheVars(p);
-        pr.rawJson       = p;
+// ═══════════════════════════════════════════════════════════════
+//  Recursive file loading with include support + dedup
+// ═══════════════════════════════════════════════════════════════
 
-        if (pr.name.empty()) continue;
-        st.presets[pr.name] = std::move(pr);
-        st.tree[kind].push_back(st.presets.rbegin()->second.name);
+static void ParsePresetsFromArray(const json& arr, PresetKind kind,
+                                   const std::string& sourceFile, AppState& st) {
+    for (auto& p : arr) {
+        std::string name = JStr(p, "name");
+        if (name.empty()) continue;
+
+        Preset pr;
+        pr.name            = name;
+        pr.displayName     = JStr(p, "displayName");
+        pr.kind            = kind;
+        pr.hidden          = p.value("hidden", false);
+        pr.inherits        = GetInherits(p);
+        pr.generator       = JStr(p, "generator");
+        pr.binaryDir       = JStr(p, "binaryDir");
+        pr.installDir      = JStr(p, "installDir");
+        pr.toolchainFile   = JStr(p, "toolchainFile");
+        pr.configurePreset = JStr(p, "configurePreset");
+        pr.configuration   = JStr(p, "configuration");
+        pr.cacheVariables  = GetCacheVars(p);
+        pr.rawJson         = p;
+        pr.sourceFile      = sourceFile;
+
+        // Dedup: remove old entry from tree vector before overwriting
+        auto& treeVec = st.tree[kind];
+        treeVec.erase(std::remove(treeVec.begin(), treeVec.end(), name), treeVec.end());
+
+        st.presets[name] = std::move(pr);
+        treeVec.push_back(name);
     }
+}
+
+static void LoadPresetFile(const std::string& path, AppState& st,
+                            std::set<std::string>& visitedFiles) {
+    std::error_code ec;
+    fs::path canonical = fs::canonical(path, ec);
+    if (ec) canonical = fs::absolute(path);
+    std::string key = canonical.string();
+
+    if (visitedFiles.count(key)) return;
+    visitedFiles.insert(key);
+
+    if (!fs::exists(canonical)) {
+        st.errorMsg += (st.errorMsg.empty() ? "" : "\n") + std::string("File not found: ") + path;
+        return;
+    }
+
+    std::ifstream f(canonical);
+    if (!f.is_open()) return;
+
+    json root;
+    try {
+        root = json::parse(f, nullptr, true, true);
+    } catch (const json::parse_error& e) {
+        st.errorMsg += (st.errorMsg.empty() ? "" : "\n") + std::string("Parse error: ") + e.what();
+        return;
+    }
+
+    if (st.version == 0) st.version = root.value("version", 0);
+
+    // Process file-level includes FIRST (included presets get overridden by this file)
+    if (root.contains("include") && root["include"].is_array()) {
+        fs::path parentDir = canonical.parent_path();
+        for (auto& inc : root["include"]) {
+            if (!inc.is_string()) continue;
+            LoadPresetFile((parentDir / inc.get<std::string>()).string(), st, visitedFiles);
+        }
+    }
+
+    std::string shortName = canonical.filename().string();
+    if (root.contains("configurePresets")) ParsePresetsFromArray(root["configurePresets"], PresetKind::Configure, shortName, st);
+    if (root.contains("buildPresets"))     ParsePresetsFromArray(root["buildPresets"],     PresetKind::Build,     shortName, st);
+    if (root.contains("testPresets"))      ParsePresetsFromArray(root["testPresets"],      PresetKind::Test,      shortName, st);
+    if (root.contains("packagePresets"))   ParsePresetsFromArray(root["packagePresets"],   PresetKind::Package,   shortName, st);
+    if (root.contains("workflowPresets"))  ParsePresetsFromArray(root["workflowPresets"],  PresetKind::Workflow,  shortName, st);
 }
 
 static bool LoadFile(const std::string& path, AppState& st) {
@@ -133,65 +212,41 @@ static bool LoadFile(const std::string& path, AppState& st) {
     st.selected.clear();
     st.resolvedText.clear();
     st.errorMsg.clear();
+    st.graphNodes.clear();
+    st.graphLayoutDone = false;
 
-    if (!fs::exists(path)) {
-        st.errorMsg = "File not found: " + path;
-        return false;
-    }
+    if (!fs::exists(path)) { st.errorMsg = "File not found: " + path; return false; }
 
-    std::ifstream f(path);
-    if (!f.is_open()) {
-        st.errorMsg = "Cannot open: " + path;
-        return false;
-    }
+    std::set<std::string> visited;
+    LoadPresetFile(path, st, visited);
 
-    json root;
-    try {
-        root = json::parse(f, nullptr, true, true); // allow comments
-    } catch (const json::parse_error& e) {
-        st.errorMsg = std::string("JSON parse error: ") + e.what();
-        return false;
-    }
-
-    st.version  = root.value("version", 0);
-    st.filePath = path;
-
-    if (root.contains("configurePresets"))  ParsePresets(root["configurePresets"],  PresetKind::Configure, st);
-    if (root.contains("buildPresets"))      ParsePresets(root["buildPresets"],      PresetKind::Build,     st);
-    if (root.contains("testPresets"))       ParsePresets(root["testPresets"],       PresetKind::Test,      st);
-    if (root.contains("packagePresets"))    ParsePresets(root["packagePresets"],    PresetKind::Package,   st);
-    if (root.contains("workflowPresets"))   ParsePresets(root["workflowPresets"],   PresetKind::Workflow,  st);
-
-    // Also try merging CMakeUserPresets.json if it lives next to the file
     auto userPath = fs::path(path).parent_path() / "CMakeUserPresets.json";
-    if (fs::exists(userPath)) {
-        std::ifstream uf(userPath);
-        try {
-            json uroot = json::parse(uf, nullptr, true, true);
-            if (uroot.contains("configurePresets"))  ParsePresets(uroot["configurePresets"],  PresetKind::Configure, st);
-            if (uroot.contains("buildPresets"))      ParsePresets(uroot["buildPresets"],      PresetKind::Build,     st);
-            if (uroot.contains("testPresets"))       ParsePresets(uroot["testPresets"],       PresetKind::Test,      st);
-            if (uroot.contains("packagePresets"))    ParsePresets(uroot["packagePresets"],    PresetKind::Package,   st);
-            if (uroot.contains("workflowPresets"))   ParsePresets(uroot["workflowPresets"],   PresetKind::Workflow,  st);
-        } catch (...) {
-            // user presets optional — silently skip on error
-        }
-    }
+    if (fs::exists(userPath))
+        LoadPresetFile(userPath.string(), st, visited);
 
-    return true;
+    st.filePath = path;
+    return st.errorMsg.empty();
 }
 
-// ─── Preset resolution (flatten inherits) ────────────────────
+// ═══════════════════════════════════════════════════════════════
+//  Inheritance resolution
+// ═══════════════════════════════════════════════════════════════
 
 struct ResolvedPreset {
-    std::string generator;
-    std::string binaryDir;
-    std::string installDir;
-    std::string toolchainFile;
-    std::string configurePreset;
-    std::string configuration;
+    std::string generator, binaryDir, installDir, toolchainFile, configurePreset, configuration;
     std::map<std::string, std::string> cacheVariables;
 };
+
+static void MergeDefaults(ResolvedPreset& dst, const ResolvedPreset& src) {
+    if (dst.generator.empty())       dst.generator       = src.generator;
+    if (dst.binaryDir.empty())       dst.binaryDir       = src.binaryDir;
+    if (dst.installDir.empty())      dst.installDir      = src.installDir;
+    if (dst.toolchainFile.empty())   dst.toolchainFile   = src.toolchainFile;
+    if (dst.configurePreset.empty()) dst.configurePreset = src.configurePreset;
+    if (dst.configuration.empty())   dst.configuration   = src.configuration;
+    for (auto& [k, v] : src.cacheVariables)
+        if (!dst.cacheVariables.count(k)) dst.cacheVariables[k] = v;
+}
 
 static ResolvedPreset Resolve(const std::string& name, const AppState& st,
                                std::set<std::string>& visited) {
@@ -199,35 +254,22 @@ static ResolvedPreset Resolve(const std::string& name, const AppState& st,
     auto it = st.presets.find(name);
     if (it == st.presets.end() || visited.count(name)) return r;
     visited.insert(name);
-
     const Preset& p = it->second;
 
-    // Resolve parents first (rightmost parent has lowest priority)
-    for (auto pit = p.inherits.rbegin(); pit != p.inherits.rend(); ++pit) {
-        ResolvedPreset parent = Resolve(*pit, st, visited);
-        // Merge: parent values are defaults, child overrides
-        if (r.generator.empty())        r.generator        = parent.generator;
-        if (r.binaryDir.empty())        r.binaryDir        = parent.binaryDir;
-        if (r.installDir.empty())       r.installDir       = parent.installDir;
-        if (r.toolchainFile.empty())    r.toolchainFile    = parent.toolchainFile;
-        if (r.configurePreset.empty())  r.configurePreset  = parent.configurePreset;
-        if (r.configuration.empty())    r.configuration    = parent.configuration;
-        for (auto& [k, v] : parent.cacheVariables) {
-            if (!r.cacheVariables.count(k)) r.cacheVariables[k] = v;
-        }
-    }
+    // This preset's own values = highest priority
+    r.generator       = p.generator;
+    r.binaryDir       = p.binaryDir;
+    r.installDir      = p.installDir;
+    r.toolchainFile   = p.toolchainFile;
+    r.configurePreset = p.configurePreset;
+    r.configuration   = p.configuration;
+    r.cacheVariables  = p.cacheVariables;
 
-    // Now apply this preset's own values (child overrides parent)
-    if (!p.generator.empty())       r.generator       = p.generator;
-    if (!p.binaryDir.empty())       r.binaryDir       = p.binaryDir;
-    if (!p.installDir.empty())      r.installDir      = p.installDir;
-    if (!p.toolchainFile.empty())   r.toolchainFile   = p.toolchainFile;
-    if (!p.configurePreset.empty()) r.configurePreset = p.configurePreset;
-    if (!p.configuration.empty())   r.configuration   = p.configuration;
-    for (auto& [k, v] : p.cacheVariables) {
-        r.cacheVariables[k] = v; // child wins
+    // Merge parents: leftmost = highest priority per CMake spec
+    for (auto& parentName : p.inherits) {
+        ResolvedPreset parent = Resolve(parentName, st, visited);
+        MergeDefaults(r, parent);
     }
-
     return r;
 }
 
@@ -244,17 +286,13 @@ static std::string BuildResolvedText(const std::string& name, const AppState& st
     if (!p.displayName.empty()) out += "  Display Name : " + p.displayName + "\n";
     out += "  Kind         : " + std::string(KindLabel(p.kind)) + "\n";
     out += "  Hidden       : " + std::string(p.hidden ? "true" : "false") + "\n";
+    out += "  Source       : " + p.sourceFile + "\n";
     if (!p.inherits.empty()) {
         out += "  Inherits     : ";
-        for (size_t i = 0; i < p.inherits.size(); ++i) {
-            if (i) out += ", ";
-            out += p.inherits[i];
-        }
+        for (size_t i = 0; i < p.inherits.size(); ++i) { if (i) out += ", "; out += p.inherits[i]; }
         out += "\n";
     }
-    out += "\n";
-
-    out += "## Resolved Fields\n";
+    out += "\n## Resolved Fields\n";
     if (!r.generator.empty())       out += "  generator        : " + r.generator       + "\n";
     if (!r.binaryDir.empty())       out += "  binaryDir        : " + r.binaryDir       + "\n";
     if (!r.installDir.empty())      out += "  installDir       : " + r.installDir      + "\n";
@@ -263,64 +301,92 @@ static std::string BuildResolvedText(const std::string& name, const AppState& st
     if (!r.configuration.empty())   out += "  configuration    : " + r.configuration   + "\n";
 
     if (!r.cacheVariables.empty()) {
-        out += "\n## Resolved Cache Variables  (child overrides parent)\n";
-        // Find longest key for alignment
+        out += "\n## Resolved Cache Variables\n";
         size_t maxLen = 0;
+        for (auto& [k, v] : r.cacheVariables) maxLen = std::max(maxLen, k.size());
         for (auto& [k, v] : r.cacheVariables)
-            maxLen = std::max(maxLen, k.size());
-
-        for (auto& [k, v] : r.cacheVariables) {
-            out += "  -D" + k;
-            out += std::string(maxLen - k.size() + 1, ' ');
-            out += "= " + v + "\n";
-        }
+            out += "  -D" + k + std::string(maxLen - k.size() + 1, ' ') + "= " + v + "\n";
     }
 
-    // Also dump the equivalent cmake command-line flags
     out += "\n## Equivalent cmake flags\n  cmake";
     if (!r.generator.empty())     out += " -G \"" + r.generator + "\"";
     if (!r.toolchainFile.empty()) out += " -DCMAKE_TOOLCHAIN_FILE=\"" + r.toolchainFile + "\"";
-    for (auto& [k, v] : r.cacheVariables)
-        out += " -D" + k + "=\"" + v + "\"";
+    for (auto& [k, v] : r.cacheVariables) out += " -D" + k + "=\"" + v + "\"";
     if (!r.binaryDir.empty())     out += " -B \"" + r.binaryDir + "\"";
     out += " .\n";
-
     return out;
 }
 
-// ─── GUI ─────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+//  Graph layout — layered / Sugiyama-style
+// ═══════════════════════════════════════════════════════════════
 
-static void DrawUI(AppState& st) {
-    const ImGuiViewport* vp = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(vp->WorkPos);
-    ImGui::SetNextWindowSize(vp->WorkSize);
-    ImGui::Begin("CMake Preset Viewer", nullptr,
-                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-                 ImGuiWindowFlags_NoMove     | ImGuiWindowFlags_NoCollapse |
-                 ImGuiWindowFlags_NoBringToFrontOnFocus);
+static void BuildGraphLayout(AppState& st) {
+    st.graphNodes.clear();
+    if (st.presets.empty()) return;
 
-    // ── Top bar: file path ──
-    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 80);
-    bool enter = ImGui::InputTextWithHint("##path", "Path to CMakePresets.json",
-                                           st.pathBuf, sizeof(st.pathBuf),
-                                           ImGuiInputTextFlags_EnterReturnsTrue);
-    ImGui::SameLine();
-    if (ImGui::Button("Load", {70, 0}) || enter) {
-        LoadFile(st.pathBuf, st);
+    // Reverse adjacency: parent -> children
+    std::map<std::string, std::vector<std::string>> children;
+    std::map<std::string, int> inDeg;
+
+    for (auto& [name, p] : st.presets) {
+        inDeg[name]; // ensure entry
+        for (auto& par : p.inherits) { children[par].push_back(name); inDeg[name]++; }
     }
 
-    if (!st.errorMsg.empty()) {
-        ImGui::TextColored({1, 0.3f, 0.3f, 1}, "%s", st.errorMsg.c_str());
+    // BFS to assign depth (longest path from root for visual clarity)
+    std::map<std::string, int> depth;
+    std::queue<std::string> q;
+    for (auto& [name, deg] : inDeg) {
+        depth[name] = -1;
+        if (deg == 0) { depth[name] = 0; q.push(name); }
     }
-    if (!st.filePath.empty()) {
-        ImGui::TextDisabled("Loaded: %s  (version %d, %zu presets)",
-                            st.filePath.c_str(), st.version, st.presets.size());
+    int maxDepth = 0;
+    while (!q.empty()) {
+        auto cur = q.front(); q.pop();
+        int d = depth[cur]; maxDepth = std::max(maxDepth, d);
+        for (auto& ch : children[cur])
+            if (depth[ch] < d + 1) { depth[ch] = d + 1; q.push(ch); }
+    }
+    for (auto& [name, d] : depth) if (d < 0) d = 0; // orphans/cycles
+
+    // Group by layer, sort within layer
+    std::map<int, std::vector<std::string>> layers;
+    for (auto& [name, d] : depth) layers[d].push_back(name);
+    for (auto& [d, names] : layers) {
+        std::sort(names.begin(), names.end(), [&](const std::string& a, const std::string& b) {
+            auto& pa = st.presets[a]; auto& pb = st.presets[b];
+            if (pa.kind != pb.kind) return (int)pa.kind < (int)pb.kind;
+            return a < b;
+        });
     }
 
-    ImGui::Checkbox("Show hidden presets", &st.showHidden);
-    ImGui::Separator();
+    const float nodeW = 220.0f, nodeH = 44.0f, layerGap = 90.0f, nodeGap = 24.0f;
 
-    // ── Two-panel layout ──
+    size_t maxWidth = 0;
+    for (auto& [d, names] : layers) maxWidth = std::max(maxWidth, names.size());
+    float totalMaxW = maxWidth * nodeW + (maxWidth > 0 ? (maxWidth - 1) * nodeGap : 0);
+
+    for (auto& [d, names] : layers) {
+        float totalW = names.size() * nodeW + (names.size() > 0 ? (names.size() - 1) * nodeGap : 0);
+        float startX = (totalMaxW - totalW) * 0.5f + 60.0f;
+        float y = 60.0f + d * (nodeH + layerGap);
+        for (size_t i = 0; i < names.size(); ++i) {
+            GraphNode gn;
+            gn.name = names[i];
+            gn.pos  = {startX + i * (nodeW + nodeGap), y};
+            gn.size = {nodeW, nodeH};
+            st.graphNodes[names[i]] = gn;
+        }
+    }
+    st.graphLayoutDone = true;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  GUI — Presets tab
+// ═══════════════════════════════════════════════════════════════
+
+static void DrawPresetsTab(AppState& st) {
     float panelW = ImGui::GetContentRegionAvail().x * 0.30f;
     ImGui::BeginChild("tree_panel", {panelW, 0}, ImGuiChildFlags_Borders | ImGuiChildFlags_ResizeX);
 
@@ -329,61 +395,356 @@ static void DrawUI(AppState& st) {
         auto it = st.tree.find(kind);
         if (it == st.tree.end() || it->second.empty()) continue;
 
-        if (ImGui::TreeNodeEx((std::string(KindLabel(kind)) + "##cat" + std::to_string((int)kind)).c_str(),
-                               ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::PushStyleColor(ImGuiCol_Text, KindColor(kind));
+        bool open = ImGui::TreeNodeEx(
+            (std::string(KindLabel(kind)) + " Presets##cat" + std::to_string((int)kind)).c_str(),
+            ImGuiTreeNodeFlags_DefaultOpen);
+        ImGui::PopStyleColor();
+
+        if (open) {
             for (auto& name : it->second) {
-                auto& p = st.presets[name];
+                auto pit = st.presets.find(name);
+                if (pit == st.presets.end()) continue;
+                auto& p = pit->second;
                 if (p.hidden && !st.showHidden) continue;
 
-                ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_Leaf |
-                                           ImGuiTreeNodeFlags_NoTreePushOnOpen;
+                ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
                 if (name == st.selected) flags |= ImGuiTreeNodeFlags_Selected;
-
                 if (p.hidden) ImGui::PushStyleColor(ImGuiCol_Text, {0.5f, 0.5f, 0.5f, 1.0f});
 
-                std::string label = (p.displayName.empty() ? name : p.displayName + "  (" + name + ")")
-                                    + "##" + name;
+                std::string label = (p.displayName.empty() ? name
+                    : p.displayName + "  (" + name + ")") + "##" + name;
                 ImGui::TreeNodeEx(label.c_str(), flags);
-
                 if (ImGui::IsItemClicked()) {
                     st.selected     = name;
                     st.resolvedText = BuildResolvedText(name, st);
                 }
-
                 if (p.hidden) ImGui::PopStyleColor();
             }
             ImGui::TreePop();
         }
     }
-
     ImGui::EndChild();
     ImGui::SameLine();
 
-    // ── Detail panel ──
     ImGui::BeginChild("detail_panel", {0, 0}, ImGuiChildFlags_Borders);
-
     if (st.selected.empty()) {
         ImGui::TextDisabled("Select a preset from the tree.");
     } else {
-        if (ImGui::Button("Copy to clipboard")) {
+        if (ImGui::Button("Copy to clipboard"))
             ImGui::SetClipboardText(st.resolvedText.c_str());
-        }
         ImGui::Separator();
         ImGui::TextUnformatted(st.resolvedText.c_str(),
                                st.resolvedText.c_str() + st.resolvedText.size());
     }
+    ImGui::EndChild();
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  GUI — Inheritance graph tab
+// ═══════════════════════════════════════════════════════════════
+
+static void DrawBezier(ImDrawList* dl, ImVec2 p0, ImVec2 p1, ImU32 col, float thick) {
+    float dy = (p1.y - p0.y) * 0.45f;
+    dl->AddBezierCubic(p0, {p0.x, p0.y + dy}, {p1.x, p1.y - dy}, p1, col, thick);
+}
+
+static void DrawGraphTab(AppState& st) {
+    if (!st.graphLayoutDone && !st.presets.empty()) BuildGraphLayout(st);
+
+    // Top bar
+    if (ImGui::Button("Re-layout")) BuildGraphLayout(st);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(150);
+    ImGui::SliderFloat("Zoom", &st.graphZoom, 0.2f, 3.0f, "%.1fx");
+    ImGui::SameLine();
+    if (ImGui::Button("Fit")) { st.graphScroll = {0, 0}; st.graphZoom = 1.0f; }
+    ImGui::SameLine();
+    ImGui::TextDisabled("   Pan: middle-drag | Zoom: scroll | Click: select | Drag: move node");
+
+    float detailW = st.selected.empty() ? 0.0f : 360.0f;
+    float graphW  = ImGui::GetContentRegionAvail().x - detailW - (detailW > 0 ? 8.0f : 0.0f);
+
+    ImGui::BeginChild("graph_canvas", {graphW, 0}, ImGuiChildFlags_Borders,
+                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+
+    ImVec2 origin = ImGui::GetCursorScreenPos();
+    ImVec2 cSize  = ImGui::GetContentRegionAvail();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImGuiIO& io   = ImGui::GetIO();
+    ImVec2 mouse  = io.MousePos;
+    bool inCanvas = ImGui::IsWindowHovered();
+
+    // Background
+    dl->AddRectFilled(origin, {origin.x + cSize.x, origin.y + cSize.y}, IM_COL32(22, 22, 28, 255));
+
+    // Grid
+    float gs = 50.0f * st.graphZoom;
+    if (gs > 8.0f) {
+        float ox = fmodf(st.graphScroll.x * st.graphZoom, gs);
+        float oy = fmodf(st.graphScroll.y * st.graphZoom, gs);
+        for (float x = ox; x < cSize.x; x += gs)
+            dl->AddLine({origin.x + x, origin.y}, {origin.x + x, origin.y + cSize.y}, IM_COL32(35, 35, 42, 255));
+        for (float y = oy; y < cSize.y; y += gs)
+            dl->AddLine({origin.x, origin.y + y}, {origin.x + cSize.x, origin.y + y}, IM_COL32(35, 35, 42, 255));
+    }
+
+    auto toScreen = [&](ImVec2 p) -> ImVec2 {
+        return {origin.x + (p.x + st.graphScroll.x) * st.graphZoom,
+                origin.y + (p.y + st.graphScroll.y) * st.graphZoom};
+    };
+    auto toCanvas = [&](ImVec2 s) -> ImVec2 {
+        return {(s.x - origin.x) / st.graphZoom - st.graphScroll.x,
+                (s.y - origin.y) / st.graphZoom - st.graphScroll.y};
+    };
+
+    // Pan
+    if (inCanvas && ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 0.0f)) {
+        st.graphScroll.x += io.MouseDelta.x / st.graphZoom;
+        st.graphScroll.y += io.MouseDelta.y / st.graphZoom;
+    }
+    // Zoom
+    if (inCanvas && io.MouseWheel != 0.0f) {
+        ImVec2 before = toCanvas(mouse);
+        st.graphZoom = std::clamp(st.graphZoom + io.MouseWheel * 0.12f, 0.15f, 3.0f);
+        ImVec2 after = toCanvas(mouse);
+        st.graphScroll.x += after.x - before.x;
+        st.graphScroll.y += after.y - before.y;
+    }
+
+    // Build highlight set: full inheritance chain of selected
+    std::set<std::string> hlSet;
+    if (!st.selected.empty()) {
+        // Ancestors
+        std::queue<std::string> bfs;
+        bfs.push(st.selected);
+        while (!bfs.empty()) {
+            auto cur = bfs.front(); bfs.pop();
+            if (hlSet.count(cur)) continue;
+            hlSet.insert(cur);
+            auto it = st.presets.find(cur);
+            if (it != st.presets.end())
+                for (auto& p : it->second.inherits) bfs.push(p);
+        }
+        // Descendants
+        std::set<std::string> vis2 = {st.selected};
+        std::queue<std::string> bfs2;
+        bfs2.push(st.selected);
+        while (!bfs2.empty()) {
+            auto cur = bfs2.front(); bfs2.pop();
+            hlSet.insert(cur);
+            for (auto& [nm, p] : st.presets) {
+                if (vis2.count(nm)) continue;
+                for (auto& inh : p.inherits) {
+                    if (inh == cur) { vis2.insert(nm); bfs2.push(nm); break; }
+                }
+            }
+        }
+    }
+
+    // ── Draw edges ──
+    for (auto& [name, p] : st.presets) {
+        auto cIt = st.graphNodes.find(name);
+        if (cIt == st.graphNodes.end()) continue;
+        auto& cn = cIt->second;
+        ImVec2 childTop = toScreen({cn.pos.x + cn.size.x * 0.5f, cn.pos.y});
+
+        for (auto& parName : p.inherits) {
+            auto pIt = st.graphNodes.find(parName);
+            if (pIt == st.graphNodes.end()) continue;
+            auto& pn = pIt->second;
+            ImVec2 parBot = toScreen({pn.pos.x + pn.size.x * 0.5f, pn.pos.y + pn.size.y});
+
+            bool chain = hlSet.count(name) && hlSet.count(parName);
+            ImU32 col   = chain ? IM_COL32(255, 210, 80, 200) : IM_COL32(90, 90, 110, 120);
+            float thick = chain ? 2.5f : 1.2f;
+
+            DrawBezier(dl, parBot, childTop, col, thick);
+
+            // Arrowhead
+            ImVec2 dir = {childTop.x - parBot.x, childTop.y - parBot.y};
+            float len = sqrtf(dir.x * dir.x + dir.y * dir.y);
+            if (len > 1.0f) {
+                dir.x /= len; dir.y /= len;
+                float as = 7.0f * st.graphZoom;
+                ImVec2 ab = {childTop.x - dir.x * as, childTop.y - dir.y * as};
+                ImVec2 pp = {-dir.y * as * 0.45f, dir.x * as * 0.45f};
+                dl->AddTriangleFilled(childTop, {ab.x + pp.x, ab.y + pp.y},
+                                      {ab.x - pp.x, ab.y - pp.y}, col);
+            }
+        }
+    }
+
+    // ── Draw nodes ──
+    std::string clickedNode;
+
+    for (auto& [name, gn] : st.graphNodes) {
+        ImVec2 sTL = toScreen(gn.pos);
+        ImVec2 sBR = toScreen({gn.pos.x + gn.size.x, gn.pos.y + gn.size.y});
+
+        bool hovered = inCanvas &&
+            mouse.x >= sTL.x && mouse.x <= sBR.x &&
+            mouse.y >= sTL.y && mouse.y <= sBR.y;
+
+        auto pit = st.presets.find(name);
+        PresetKind kind = pit != st.presets.end() ? pit->second.kind : PresetKind::Configure;
+        bool isHidden = pit != st.presets.end() && pit->second.hidden;
+        bool isSel    = (name == st.selected);
+        bool inChain  = hlSet.count(name) > 0;
+        float alpha   = (!st.selected.empty() && !inChain) ? 0.30f : 1.0f;
+
+        ImU32 kindCol = KindColor(kind);
+        unsigned char kr = (kindCol >> 0) & 0xFF, kg = (kindCol >> 8) & 0xFF,
+                      kb = (kindCol >> 16) & 0xFF;
+
+        ImU32 fill = isSel    ? IM_COL32(55, 55, 75, (int)(255*alpha))
+                   : hovered  ? IM_COL32(45, 45, 60, (int)(255*alpha))
+                              : IM_COL32(32, 32, 42, (int)(255*alpha));
+        ImU32 border = isSel  ? IM_COL32(255, 210, 80, (int)(255*alpha))
+                              : IM_COL32(kr, kg, kb, (int)(200*alpha));
+        float rounding = 6.0f * st.graphZoom;
+
+        // Shadow
+        dl->AddRectFilled({sTL.x+2, sTL.y+2}, {sBR.x+2, sBR.y+2},
+                          IM_COL32(0,0,0,(int)(60*alpha)), rounding);
+        dl->AddRectFilled(sTL, sBR, fill, rounding);
+        dl->AddRect(sTL, sBR, border, rounding, 0, isSel ? 2.5f : 1.5f);
+
+        // Kind bar
+        float barW = 5.0f * st.graphZoom;
+        dl->AddRectFilled(sTL, {sTL.x + barW, sBR.y},
+                          IM_COL32(kr, kg, kb, (int)(255*alpha)), rounding, ImDrawFlags_RoundCornersLeft);
+
+        // Label
+        float fs = std::max(10.0f, 13.0f * st.graphZoom);
+        float tx = sTL.x + barW + 6.0f * st.graphZoom;
+        float ty = sTL.y + (sBR.y - sTL.y - fs) * 0.5f;
+        ImU32 tcol = isHidden ? IM_COL32(110,110,110,(int)(255*alpha))
+                              : IM_COL32(215,215,225,(int)(255*alpha));
+        std::string lbl = (pit != st.presets.end() && !pit->second.displayName.empty())
+                          ? pit->second.displayName : name;
+        dl->AddText(nullptr, fs, {tx, ty}, tcol, lbl.c_str());
+
+        // Tooltip
+        if (hovered) {
+            ImGui::BeginTooltip();
+            ImGui::TextColored(ImColor(kindCol), "[%s]", KindLabel(kind));
+            ImGui::SameLine(); ImGui::Text(" %s", name.c_str());
+            if (pit != st.presets.end()) {
+                if (!pit->second.displayName.empty())
+                    ImGui::TextDisabled("%s", pit->second.displayName.c_str());
+                if (pit->second.hidden) ImGui::TextDisabled("(hidden)");
+                ImGui::TextDisabled("Source: %s", pit->second.sourceFile.c_str());
+                if (!pit->second.inherits.empty()) {
+                    ImGui::Text("Inherits:");
+                    for (auto& inh : pit->second.inherits)
+                        ImGui::BulletText("%s", inh.c_str());
+                }
+            }
+            ImGui::EndTooltip();
+        }
+
+        if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            clickedNode = name;
+            if (st.graphDragging.empty()) st.graphDragging = name;
+        }
+    }
+
+    // Drag
+    if (!st.graphDragging.empty()) {
+        if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            auto it = st.graphNodes.find(st.graphDragging);
+            if (it != st.graphNodes.end()) {
+                it->second.pos.x += io.MouseDelta.x / st.graphZoom;
+                it->second.pos.y += io.MouseDelta.y / st.graphZoom;
+            }
+        } else {
+            st.graphDragging.clear();
+        }
+    }
+
+    // Select / deselect
+    if (!clickedNode.empty()) {
+        st.selected = clickedNode;
+        st.resolvedText = BuildResolvedText(clickedNode, st);
+    }
+    if (inCanvas && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && clickedNode.empty() && st.graphDragging.empty()) {
+        st.selected.clear();
+        st.resolvedText.clear();
+    }
+
+    // Legend
+    {
+        ImVec2 lp = {origin.x + 12, origin.y + cSize.y - 26};
+        for (auto k : {PresetKind::Configure, PresetKind::Build, PresetKind::Test,
+                       PresetKind::Package, PresetKind::Workflow}) {
+            dl->AddRectFilled(lp, {lp.x+10, lp.y+10}, KindColor(k), 2.0f);
+            dl->AddText({lp.x+14, lp.y-2}, IM_COL32(170,170,180,255), KindLabel(k));
+            lp.x += ImGui::CalcTextSize(KindLabel(k)).x + 28;
+        }
+    }
 
     ImGui::EndChild();
+
+    // Side detail panel
+    if (!st.selected.empty()) {
+        ImGui::SameLine();
+        ImGui::BeginChild("graph_detail", {detailW, 0}, ImGuiChildFlags_Borders);
+        if (ImGui::Button("Copy##gd"))
+            ImGui::SetClipboardText(st.resolvedText.c_str());
+        ImGui::Separator();
+        ImGui::TextUnformatted(st.resolvedText.c_str(),
+                               st.resolvedText.c_str() + st.resolvedText.size());
+        ImGui::EndChild();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Main GUI frame
+// ═══════════════════════════════════════════════════════════════
+
+static void DrawUI(AppState& st) {
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(vp->WorkPos);
+    ImGui::SetNextWindowSize(vp->WorkSize);
+    ImGui::Begin("CMake Preset Viewer", nullptr,
+                 ImGuiWindowFlags_NoTitleBar  | ImGuiWindowFlags_NoResize |
+                 ImGuiWindowFlags_NoMove      | ImGuiWindowFlags_NoCollapse |
+                 ImGuiWindowFlags_NoBringToFrontOnFocus);
+
+    // Top bar
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 80);
+    bool enter = ImGui::InputTextWithHint("##path", "Path to CMakePresets.json",
+                                           st.pathBuf, sizeof(st.pathBuf),
+                                           ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::SameLine();
+    if (ImGui::Button("Load", {70, 0}) || enter) LoadFile(st.pathBuf, st);
+
+    if (!st.errorMsg.empty())
+        ImGui::TextColored({1, 0.3f, 0.3f, 1}, "%s", st.errorMsg.c_str());
+    if (!st.filePath.empty())
+        ImGui::TextDisabled("Loaded: %s  (version %d, %zu presets)",
+                            st.filePath.c_str(), st.version, st.presets.size());
+
+    ImGui::Checkbox("Show hidden", &st.showHidden);
+    ImGui::Separator();
+
+    // Tabs
+    if (ImGui::BeginTabBar("MainTabs")) {
+        if (ImGui::BeginTabItem("Presets"))           { st.activeTab = 0; DrawPresetsTab(st); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Inheritance Graph")) { st.activeTab = 1; DrawGraphTab(st);   ImGui::EndTabItem(); }
+        ImGui::EndTabBar();
+    }
+
     ImGui::End();
 }
 
-// ─── Main ────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+//  Entry point
+// ═══════════════════════════════════════════════════════════════
 
 int main(int argc, char* argv[]) {
-    if (!glfwInit()) {
-        fprintf(stderr, "Failed to init GLFW\n");
-        return 1;
-    }
+    if (!glfwInit()) { fprintf(stderr, "Failed to init GLFW\n"); return 1; }
 
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
@@ -392,14 +753,10 @@ int main(int argc, char* argv[]) {
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 #endif
 
-    GLFWwindow* window = glfwCreateWindow(1280, 720, "CMake Preset Viewer", nullptr, nullptr);
-    if (!window) {
-        fprintf(stderr, "Failed to create window\n");
-        glfwTerminate();
-        return 1;
-    }
+    GLFWwindow* window = glfwCreateWindow(1400, 800, "CMake Preset Viewer", nullptr, nullptr);
+    if (!window) { fprintf(stderr, "Failed to create window\n"); glfwTerminate(); return 1; }
     glfwMakeContextCurrent(window);
-    glfwSwapInterval(1); // vsync
+    glfwSwapInterval(1);
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -407,43 +764,36 @@ int main(int argc, char* argv[]) {
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
     ImGui::StyleColorsDark();
-
-    // Slightly nicer style tweaks
     ImGuiStyle& style = ImGui::GetStyle();
     style.FrameRounding  = 4.0f;
     style.GrabRounding   = 4.0f;
+    style.TabRounding    = 4.0f;
     style.WindowRounding = 0.0f;
     style.FramePadding   = {8, 4};
     style.ItemSpacing    = {8, 6};
+    style.Colors[ImGuiCol_Tab]         = ImVec4(0.18f, 0.18f, 0.22f, 1.0f);
+    style.Colors[ImGuiCol_TabSelected] = ImVec4(0.28f, 0.28f, 0.38f, 1.0f);
+    style.Colors[ImGuiCol_TabHovered]  = ImVec4(0.32f, 0.32f, 0.45f, 1.0f);
 
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 330");
 
     AppState st;
-
-    // If a path was given on the command line, load it immediately
-    if (argc > 1) {
-        snprintf(st.pathBuf, sizeof(st.pathBuf), "%s", argv[1]);
-        LoadFile(argv[1], st);
-    }
+    if (argc > 1) { snprintf(st.pathBuf, sizeof(st.pathBuf), "%s", argv[1]); LoadFile(argv[1], st); }
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
-
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
-
         DrawUI(st);
-
         ImGui::Render();
         int w, h;
         glfwGetFramebufferSize(window, &w, &h);
         glViewport(0, 0, w, h);
-        glClearColor(0.10f, 0.10f, 0.12f, 1.0f);
+        glClearColor(0.08f, 0.08f, 0.10f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-
         glfwSwapBuffers(window);
     }
 
@@ -460,10 +810,7 @@ int main(int argc, char* argv[]) {
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR lpCmdLine, int) {
     int argc = 1;
     char* argv[2] = { (char*)"preset_viewer", nullptr };
-    if (lpCmdLine && lpCmdLine[0]) {
-        argv[1] = lpCmdLine;
-        argc = 2;
-    }
+    if (lpCmdLine && lpCmdLine[0]) { argv[1] = lpCmdLine; argc = 2; }
     return main(argc, argv);
 }
 #endif
