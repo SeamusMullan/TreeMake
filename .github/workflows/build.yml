@@ -26,16 +26,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Generate icon assets
-        run: |
-          pip install pillow cairosvg
-          python scripts/generate_icons.py
-
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
