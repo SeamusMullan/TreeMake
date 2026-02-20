@@ -4,6 +4,7 @@
 
 #include <GLFW/glfw3.h>
 #include <nlohmann/json.hpp>
+#include <nfd.h>
 
 #include <algorithm>
 #include <cmath>
@@ -55,12 +56,8 @@ struct Preset {
     std::vector<std::string> inherits;
     std::string              sourceFile;
 
-    std::string generator;
-    std::string binaryDir;
-    std::string installDir;
-    std::string toolchainFile;
-    std::string configurePreset;
-    std::string configuration;
+    std::string generator, binaryDir, installDir, toolchainFile;
+    std::string configurePreset, configuration;
     std::map<std::string, std::string> cacheVariables;
     json        rawJson;
 };
@@ -89,7 +86,75 @@ struct AppState {
     float                                graphZoom = 1.0f;
     bool                                 graphLayoutDone = false;
     std::string                          graphDragging;
+
+    // Diff
+    int                                  diffLeft  = -1;
+    int                                  diffRight = -1;
+    std::string                          diffTextLeft;
+    std::string                          diffTextRight;
+    std::vector<std::string>             presetNames; // sorted list for combo boxes
+
+    // Recent files
+    std::vector<std::string>             recentFiles;
+
+    // Pending file load (from drag-drop or dialog, deferred to main loop)
+    std::string                          pendingLoad;
 };
+
+// Global pointer for GLFW callbacks
+static AppState* g_appState = nullptr;
+
+// ═══════════════════════════════════════════════════════════════
+//  Recent files
+// ═══════════════════════════════════════════════════════════════
+
+static fs::path GetRecentFilePath() {
+#ifdef _WIN32
+    const char* appdata = std::getenv("APPDATA");
+    if (appdata) return fs::path(appdata) / "CMakePresetViewer" / "recent.txt";
+    return fs::path(".") / ".cmake_preset_viewer_recent";
+#else
+    const char* home = std::getenv("HOME");
+    if (home) return fs::path(home) / ".config" / "cmake-preset-viewer" / "recent.txt";
+    return fs::path(".") / ".cmake_preset_viewer_recent";
+#endif
+}
+
+static void LoadRecentFiles(AppState& st) {
+    st.recentFiles.clear();
+    auto path = GetRecentFilePath();
+    if (!fs::exists(path)) return;
+    std::ifstream f(path);
+    std::string line;
+    while (std::getline(f, line)) {
+        if (!line.empty() && st.recentFiles.size() < 15)
+            st.recentFiles.push_back(line);
+    }
+}
+
+static void SaveRecentFiles(const AppState& st) {
+    auto path = GetRecentFilePath();
+    std::error_code ec;
+    fs::create_directories(path.parent_path(), ec);
+    std::ofstream f(path);
+    for (auto& p : st.recentFiles) f << p << "\n";
+}
+
+static void AddToRecent(AppState& st, const std::string& filePath) {
+    std::error_code ec;
+    std::string canonical = fs::canonical(filePath, ec).string();
+    if (ec) canonical = fs::absolute(filePath).string();
+
+    // Remove if already present
+    st.recentFiles.erase(
+        std::remove(st.recentFiles.begin(), st.recentFiles.end(), canonical),
+        st.recentFiles.end());
+    // Insert at front
+    st.recentFiles.insert(st.recentFiles.begin(), canonical);
+    // Cap at 15
+    if (st.recentFiles.size() > 15) st.recentFiles.resize(15);
+    SaveRecentFiles(st);
+}
 
 // ═══════════════════════════════════════════════════════════════
 //  JSON helpers
@@ -127,7 +192,7 @@ static std::string JStr(const json& j, const char* key) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  Recursive file loading with include support + dedup
+//  File loading
 // ═══════════════════════════════════════════════════════════════
 
 static void ParsePresetsFromArray(const json& arr, PresetKind kind,
@@ -152,10 +217,8 @@ static void ParsePresetsFromArray(const json& arr, PresetKind kind,
         pr.rawJson         = p;
         pr.sourceFile      = sourceFile;
 
-        // Dedup: remove old entry from tree vector before overwriting
         auto& treeVec = st.tree[kind];
         treeVec.erase(std::remove(treeVec.begin(), treeVec.end(), name), treeVec.end());
-
         st.presets[name] = std::move(pr);
         treeVec.push_back(name);
     }
@@ -189,7 +252,6 @@ static void LoadPresetFile(const std::string& path, AppState& st,
 
     if (st.version == 0) st.version = root.value("version", 0);
 
-    // Process file-level includes FIRST (included presets get overridden by this file)
     if (root.contains("include") && root["include"].is_array()) {
         fs::path parentDir = canonical.parent_path();
         for (auto& inc : root["include"]) {
@@ -214,6 +276,10 @@ static bool LoadFile(const std::string& path, AppState& st) {
     st.errorMsg.clear();
     st.graphNodes.clear();
     st.graphLayoutDone = false;
+    st.diffLeft = st.diffRight = -1;
+    st.diffTextLeft.clear();
+    st.diffTextRight.clear();
+    st.presetNames.clear();
 
     if (!fs::exists(path)) { st.errorMsg = "File not found: " + path; return false; }
 
@@ -225,7 +291,42 @@ static bool LoadFile(const std::string& path, AppState& st) {
         LoadPresetFile(userPath.string(), st, visited);
 
     st.filePath = path;
+    snprintf(st.pathBuf, sizeof(st.pathBuf), "%s", path.c_str());
+
+    // Build sorted preset names list for diff combos
+    for (auto& [name, _] : st.presets) st.presetNames.push_back(name);
+    std::sort(st.presetNames.begin(), st.presetNames.end());
+
+    AddToRecent(st, path);
     return st.errorMsg.empty();
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Native file dialog
+// ═══════════════════════════════════════════════════════════════
+
+static void OpenFileDialog(AppState& st) {
+    nfdu8char_t* outPath = nullptr;
+    nfdu8filteritem_t filters[1] = { { "CMake Presets", "json" } };
+    nfdopendialogu8args_t args = {};
+    args.filterList = filters;
+    args.filterCount = 1;
+
+    nfdresult_t result = NFD_OpenDialogU8_With(&outPath, &args);
+    if (result == NFD_OKAY && outPath) {
+        st.pendingLoad = outPath;
+        NFD_FreePathU8(outPath);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  GLFW drag-and-drop callback
+// ═══════════════════════════════════════════════════════════════
+
+static void DropCallback(GLFWwindow*, int count, const char* paths[]) {
+    if (count > 0 && g_appState) {
+        g_appState->pendingLoad = paths[0];
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -256,7 +357,6 @@ static ResolvedPreset Resolve(const std::string& name, const AppState& st,
     visited.insert(name);
     const Preset& p = it->second;
 
-    // This preset's own values = highest priority
     r.generator       = p.generator;
     r.binaryDir       = p.binaryDir;
     r.installDir      = p.installDir;
@@ -265,7 +365,6 @@ static ResolvedPreset Resolve(const std::string& name, const AppState& st,
     r.configuration   = p.configuration;
     r.cacheVariables  = p.cacheVariables;
 
-    // Merge parents: leftmost = highest priority per CMake spec
     for (auto& parentName : p.inherits) {
         ResolvedPreset parent = Resolve(parentName, st, visited);
         MergeDefaults(r, parent);
@@ -318,23 +417,102 @@ static std::string BuildResolvedText(const std::string& name, const AppState& st
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  Graph layout — layered / Sugiyama-style
+//  Diff helpers
+// ═══════════════════════════════════════════════════════════════
+
+struct DiffLine {
+    std::string text;
+    int         status; // 0 = same, -1 = left only, +1 = right only, 2 = changed
+};
+
+static void BuildDiffLines(const std::string& leftName, const std::string& rightName,
+                            const AppState& st,
+                            std::vector<DiffLine>& leftLines,
+                            std::vector<DiffLine>& rightLines) {
+    leftLines.clear();
+    rightLines.clear();
+
+    auto litP = st.presets.find(leftName);
+    auto ritP = st.presets.find(rightName);
+    if (litP == st.presets.end() || ritP == st.presets.end()) return;
+
+    std::set<std::string> lv, rv;
+    ResolvedPreset lr = Resolve(leftName, st, lv);
+    ResolvedPreset rr = Resolve(rightName, st, rv);
+
+    // Collect all keys from both
+    std::set<std::string> allKeys;
+    for (auto& [k, _] : lr.cacheVariables) allKeys.insert(k);
+    for (auto& [k, _] : rr.cacheVariables) allKeys.insert(k);
+
+    // Header fields
+    struct FieldPair { std::string label, leftVal, rightVal; };
+    std::vector<FieldPair> fields;
+
+    auto addField = [&](const char* label, const std::string& l, const std::string& r) {
+        if (!l.empty() || !r.empty()) fields.push_back({label, l, r});
+    };
+    addField("Kind",           KindLabel(litP->second.kind), KindLabel(ritP->second.kind));
+    addField("Hidden",         litP->second.hidden ? "true" : "false",
+                                ritP->second.hidden ? "true" : "false");
+    addField("Source",         litP->second.sourceFile, ritP->second.sourceFile);
+    addField("generator",      lr.generator,       rr.generator);
+    addField("binaryDir",      lr.binaryDir,       rr.binaryDir);
+    addField("installDir",     lr.installDir,      rr.installDir);
+    addField("toolchainFile",  lr.toolchainFile,   rr.toolchainFile);
+    addField("configurePreset",lr.configurePreset, rr.configurePreset);
+    addField("configuration",  lr.configuration,   rr.configuration);
+
+    for (auto& fp : fields) {
+        int status = (fp.leftVal == fp.rightVal) ? 0 : 2;
+        leftLines.push_back({fp.label + ": " + fp.leftVal, status});
+        rightLines.push_back({fp.label + ": " + fp.rightVal, status});
+    }
+
+    // Separator
+    leftLines.push_back({"--- Cache Variables ---", 0});
+    rightLines.push_back({"--- Cache Variables ---", 0});
+
+    for (auto& k : allKeys) {
+        bool inL = lr.cacheVariables.count(k) > 0;
+        bool inR = rr.cacheVariables.count(k) > 0;
+        std::string lval = inL ? lr.cacheVariables.at(k) : "";
+        std::string rval = inR ? rr.cacheVariables.at(k) : "";
+
+        std::string lineL = "-D" + k + " = " + lval;
+        std::string lineR = "-D" + k + " = " + rval;
+
+        if (inL && inR && lval == rval) {
+            leftLines.push_back({lineL, 0});
+            rightLines.push_back({lineR, 0});
+        } else if (inL && inR) {
+            leftLines.push_back({lineL, 2});
+            rightLines.push_back({lineR, 2});
+        } else if (inL && !inR) {
+            leftLines.push_back({lineL, -1});
+            rightLines.push_back({"", -1});
+        } else {
+            leftLines.push_back({"", 1});
+            rightLines.push_back({lineR, 1});
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Graph layout
 // ═══════════════════════════════════════════════════════════════
 
 static void BuildGraphLayout(AppState& st) {
     st.graphNodes.clear();
     if (st.presets.empty()) return;
 
-    // Reverse adjacency: parent -> children
     std::map<std::string, std::vector<std::string>> children;
     std::map<std::string, int> inDeg;
-
     for (auto& [name, p] : st.presets) {
-        inDeg[name]; // ensure entry
+        inDeg[name];
         for (auto& par : p.inherits) { children[par].push_back(name); inDeg[name]++; }
     }
 
-    // BFS to assign depth (longest path from root for visual clarity)
     std::map<std::string, int> depth;
     std::queue<std::string> q;
     for (auto& [name, deg] : inDeg) {
@@ -348,38 +526,78 @@ static void BuildGraphLayout(AppState& st) {
         for (auto& ch : children[cur])
             if (depth[ch] < d + 1) { depth[ch] = d + 1; q.push(ch); }
     }
-    for (auto& [name, d] : depth) if (d < 0) d = 0; // orphans/cycles
+    for (auto& [name, d] : depth) if (d < 0) d = 0;
 
-    // Group by layer, sort within layer
     std::map<int, std::vector<std::string>> layers;
     for (auto& [name, d] : depth) layers[d].push_back(name);
-    for (auto& [d, names] : layers) {
+    for (auto& [d, names] : layers)
         std::sort(names.begin(), names.end(), [&](const std::string& a, const std::string& b) {
             auto& pa = st.presets[a]; auto& pb = st.presets[b];
             if (pa.kind != pb.kind) return (int)pa.kind < (int)pb.kind;
             return a < b;
         });
-    }
 
-    const float nodeW = 220.0f, nodeH = 44.0f, layerGap = 90.0f, nodeGap = 24.0f;
-
+    const float nodeW = 220, nodeH = 44, layerGap = 90, nodeGap = 24;
     size_t maxWidth = 0;
     for (auto& [d, names] : layers) maxWidth = std::max(maxWidth, names.size());
     float totalMaxW = maxWidth * nodeW + (maxWidth > 0 ? (maxWidth - 1) * nodeGap : 0);
 
     for (auto& [d, names] : layers) {
         float totalW = names.size() * nodeW + (names.size() > 0 ? (names.size() - 1) * nodeGap : 0);
-        float startX = (totalMaxW - totalW) * 0.5f + 60.0f;
-        float y = 60.0f + d * (nodeH + layerGap);
+        float startX = (totalMaxW - totalW) * 0.5f + 60;
+        float y = 60 + d * (nodeH + layerGap);
         for (size_t i = 0; i < names.size(); ++i) {
-            GraphNode gn;
-            gn.name = names[i];
-            gn.pos  = {startX + i * (nodeW + nodeGap), y};
+            GraphNode gn; gn.name = names[i];
+            gn.pos = {startX + i * (nodeW + nodeGap), y};
             gn.size = {nodeW, nodeH};
             st.graphNodes[names[i]] = gn;
         }
     }
     st.graphLayoutDone = true;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  GUI — Menu bar
+// ═══════════════════════════════════════════════════════════════
+
+static void DrawMenuBar(AppState& st) {
+    if (ImGui::BeginMenuBar()) {
+        if (ImGui::BeginMenu("File")) {
+            if (ImGui::MenuItem("Open...", "Ctrl+O")) {
+                OpenFileDialog(st);
+            }
+            if (ImGui::BeginMenu("Recent Files", !st.recentFiles.empty())) {
+                for (size_t i = 0; i < st.recentFiles.size(); ++i) {
+                    std::string label = st.recentFiles[i];
+                    // Show just filename + parent for readability
+                    fs::path p(label);
+                    std::string shortLabel = p.parent_path().filename().string() + "/" + p.filename().string();
+                    if (ImGui::MenuItem((shortLabel + "##recent" + std::to_string(i)).c_str())) {
+                        st.pendingLoad = st.recentFiles[i];
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::BeginTooltip();
+                        ImGui::TextUnformatted(label.c_str());
+                        ImGui::EndTooltip();
+                    }
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("Clear Recent")) {
+                    st.recentFiles.clear();
+                    SaveRecentFiles(st);
+                }
+                ImGui::EndMenu();
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Quit", "Alt+F4")) {
+                // Will be handled by GLFW
+                if (auto* win = glfwGetCurrentContext())
+                    glfwSetWindowShouldClose(win, GLFW_TRUE);
+            }
+            ImGui::EndMenu();
+        }
+        ImGui::EndMenuBar();
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -416,7 +634,7 @@ static void DrawPresetsTab(AppState& st) {
                     : p.displayName + "  (" + name + ")") + "##" + name;
                 ImGui::TreeNodeEx(label.c_str(), flags);
                 if (ImGui::IsItemClicked()) {
-                    st.selected     = name;
+                    st.selected = name;
                     st.resolvedText = BuildResolvedText(name, st);
                 }
                 if (p.hidden) ImGui::PopStyleColor();
@@ -441,7 +659,7 @@ static void DrawPresetsTab(AppState& st) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  GUI — Inheritance graph tab
+//  GUI — Graph tab
 // ═══════════════════════════════════════════════════════════════
 
 static void DrawBezier(ImDrawList* dl, ImVec2 p0, ImVec2 p1, ImU32 col, float thick) {
@@ -452,7 +670,6 @@ static void DrawBezier(ImDrawList* dl, ImVec2 p0, ImVec2 p1, ImU32 col, float th
 static void DrawGraphTab(AppState& st) {
     if (!st.graphLayoutDone && !st.presets.empty()) BuildGraphLayout(st);
 
-    // Top bar
     if (ImGui::Button("Re-layout")) BuildGraphLayout(st);
     ImGui::SameLine();
     ImGui::SetNextItemWidth(150);
@@ -460,7 +677,7 @@ static void DrawGraphTab(AppState& st) {
     ImGui::SameLine();
     if (ImGui::Button("Fit")) { st.graphScroll = {0, 0}; st.graphZoom = 1.0f; }
     ImGui::SameLine();
-    ImGui::TextDisabled("   Pan: middle-drag | Zoom: scroll | Click: select | Drag: move node");
+    ImGui::TextDisabled("   Pan: middle-drag | Zoom: scroll | Click: select | Drag: move");
 
     float detailW = st.selected.empty() ? 0.0f : 360.0f;
     float graphW  = ImGui::GetContentRegionAvail().x - detailW - (detailW > 0 ? 8.0f : 0.0f);
@@ -475,10 +692,8 @@ static void DrawGraphTab(AppState& st) {
     ImVec2 mouse  = io.MousePos;
     bool inCanvas = ImGui::IsWindowHovered();
 
-    // Background
     dl->AddRectFilled(origin, {origin.x + cSize.x, origin.y + cSize.y}, IM_COL32(22, 22, 28, 255));
 
-    // Grid
     float gs = 50.0f * st.graphZoom;
     if (gs > 8.0f) {
         float ox = fmodf(st.graphScroll.x * st.graphZoom, gs);
@@ -498,12 +713,10 @@ static void DrawGraphTab(AppState& st) {
                 (s.y - origin.y) / st.graphZoom - st.graphScroll.y};
     };
 
-    // Pan
     if (inCanvas && ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 0.0f)) {
         st.graphScroll.x += io.MouseDelta.x / st.graphZoom;
         st.graphScroll.y += io.MouseDelta.y / st.graphZoom;
     }
-    // Zoom
     if (inCanvas && io.MouseWheel != 0.0f) {
         ImVec2 before = toCanvas(mouse);
         st.graphZoom = std::clamp(st.graphZoom + io.MouseWheel * 0.12f, 0.15f, 3.0f);
@@ -512,10 +725,9 @@ static void DrawGraphTab(AppState& st) {
         st.graphScroll.y += after.y - before.y;
     }
 
-    // Build highlight set: full inheritance chain of selected
+    // Highlight chain
     std::set<std::string> hlSet;
     if (!st.selected.empty()) {
-        // Ancestors
         std::queue<std::string> bfs;
         bfs.push(st.selected);
         while (!bfs.empty()) {
@@ -526,7 +738,6 @@ static void DrawGraphTab(AppState& st) {
             if (it != st.presets.end())
                 for (auto& p : it->second.inherits) bfs.push(p);
         }
-        // Descendants
         std::set<std::string> vis2 = {st.selected};
         std::queue<std::string> bfs2;
         bfs2.push(st.selected);
@@ -535,110 +746,93 @@ static void DrawGraphTab(AppState& st) {
             hlSet.insert(cur);
             for (auto& [nm, p] : st.presets) {
                 if (vis2.count(nm)) continue;
-                for (auto& inh : p.inherits) {
+                for (auto& inh : p.inherits)
                     if (inh == cur) { vis2.insert(nm); bfs2.push(nm); break; }
-                }
             }
         }
     }
 
-    // ── Draw edges ──
+    // Edges
     for (auto& [name, p] : st.presets) {
         auto cIt = st.graphNodes.find(name);
         if (cIt == st.graphNodes.end()) continue;
         auto& cn = cIt->second;
         ImVec2 childTop = toScreen({cn.pos.x + cn.size.x * 0.5f, cn.pos.y});
-
         for (auto& parName : p.inherits) {
             auto pIt = st.graphNodes.find(parName);
             if (pIt == st.graphNodes.end()) continue;
             auto& pn = pIt->second;
             ImVec2 parBot = toScreen({pn.pos.x + pn.size.x * 0.5f, pn.pos.y + pn.size.y});
-
             bool chain = hlSet.count(name) && hlSet.count(parName);
-            ImU32 col   = chain ? IM_COL32(255, 210, 80, 200) : IM_COL32(90, 90, 110, 120);
-            float thick = chain ? 2.5f : 1.2f;
-
-            DrawBezier(dl, parBot, childTop, col, thick);
-
-            // Arrowhead
+            DrawBezier(dl, parBot, childTop,
+                       chain ? IM_COL32(255,210,80,200) : IM_COL32(90,90,110,120),
+                       chain ? 2.5f : 1.2f);
+            // Arrow
             ImVec2 dir = {childTop.x - parBot.x, childTop.y - parBot.y};
-            float len = sqrtf(dir.x * dir.x + dir.y * dir.y);
-            if (len > 1.0f) {
+            float len = sqrtf(dir.x*dir.x + dir.y*dir.y);
+            if (len > 1) {
                 dir.x /= len; dir.y /= len;
-                float as = 7.0f * st.graphZoom;
-                ImVec2 ab = {childTop.x - dir.x * as, childTop.y - dir.y * as};
-                ImVec2 pp = {-dir.y * as * 0.45f, dir.x * as * 0.45f};
-                dl->AddTriangleFilled(childTop, {ab.x + pp.x, ab.y + pp.y},
-                                      {ab.x - pp.x, ab.y - pp.y}, col);
+                float as = 7 * st.graphZoom;
+                ImVec2 ab = {childTop.x - dir.x*as, childTop.y - dir.y*as};
+                ImVec2 pp = {-dir.y*as*0.45f, dir.x*as*0.45f};
+                dl->AddTriangleFilled(childTop, {ab.x+pp.x,ab.y+pp.y}, {ab.x-pp.x,ab.y-pp.y},
+                                      chain ? IM_COL32(255,210,80,200) : IM_COL32(90,90,110,120));
             }
         }
     }
 
-    // ── Draw nodes ──
+    // Nodes
     std::string clickedNode;
-
     for (auto& [name, gn] : st.graphNodes) {
         ImVec2 sTL = toScreen(gn.pos);
         ImVec2 sBR = toScreen({gn.pos.x + gn.size.x, gn.pos.y + gn.size.y});
-
-        bool hovered = inCanvas &&
-            mouse.x >= sTL.x && mouse.x <= sBR.x &&
-            mouse.y >= sTL.y && mouse.y <= sBR.y;
+        bool hovered = inCanvas && mouse.x>=sTL.x && mouse.x<=sBR.x && mouse.y>=sTL.y && mouse.y<=sBR.y;
 
         auto pit = st.presets.find(name);
         PresetKind kind = pit != st.presets.end() ? pit->second.kind : PresetKind::Configure;
         bool isHidden = pit != st.presets.end() && pit->second.hidden;
-        bool isSel    = (name == st.selected);
-        bool inChain  = hlSet.count(name) > 0;
-        float alpha   = (!st.selected.empty() && !inChain) ? 0.30f : 1.0f;
+        bool isSel = (name == st.selected);
+        bool inChain = hlSet.count(name) > 0;
+        float alpha = (!st.selected.empty() && !inChain) ? 0.30f : 1.0f;
 
         ImU32 kindCol = KindColor(kind);
-        unsigned char kr = (kindCol >> 0) & 0xFF, kg = (kindCol >> 8) & 0xFF,
-                      kb = (kindCol >> 16) & 0xFF;
+        unsigned char kr=(kindCol>>0)&0xFF, kg=(kindCol>>8)&0xFF, kb=(kindCol>>16)&0xFF;
 
-        ImU32 fill = isSel    ? IM_COL32(55, 55, 75, (int)(255*alpha))
-                   : hovered  ? IM_COL32(45, 45, 60, (int)(255*alpha))
-                              : IM_COL32(32, 32, 42, (int)(255*alpha));
-        ImU32 border = isSel  ? IM_COL32(255, 210, 80, (int)(255*alpha))
-                              : IM_COL32(kr, kg, kb, (int)(200*alpha));
-        float rounding = 6.0f * st.graphZoom;
+        ImU32 fill = isSel ? IM_COL32(55,55,75,(int)(255*alpha))
+                   : hovered ? IM_COL32(45,45,60,(int)(255*alpha))
+                   : IM_COL32(32,32,42,(int)(255*alpha));
+        ImU32 border = isSel ? IM_COL32(255,210,80,(int)(255*alpha))
+                             : IM_COL32(kr,kg,kb,(int)(200*alpha));
+        float rounding = 6*st.graphZoom;
 
-        // Shadow
-        dl->AddRectFilled({sTL.x+2, sTL.y+2}, {sBR.x+2, sBR.y+2},
-                          IM_COL32(0,0,0,(int)(60*alpha)), rounding);
+        dl->AddRectFilled({sTL.x+2,sTL.y+2},{sBR.x+2,sBR.y+2}, IM_COL32(0,0,0,(int)(60*alpha)), rounding);
         dl->AddRectFilled(sTL, sBR, fill, rounding);
         dl->AddRect(sTL, sBR, border, rounding, 0, isSel ? 2.5f : 1.5f);
 
-        // Kind bar
-        float barW = 5.0f * st.graphZoom;
-        dl->AddRectFilled(sTL, {sTL.x + barW, sBR.y},
-                          IM_COL32(kr, kg, kb, (int)(255*alpha)), rounding, ImDrawFlags_RoundCornersLeft);
+        float barW = 5*st.graphZoom;
+        dl->AddRectFilled(sTL, {sTL.x+barW, sBR.y}, IM_COL32(kr,kg,kb,(int)(255*alpha)),
+                          rounding, ImDrawFlags_RoundCornersLeft);
 
-        // Label
-        float fs = std::max(10.0f, 13.0f * st.graphZoom);
-        float tx = sTL.x + barW + 6.0f * st.graphZoom;
-        float ty = sTL.y + (sBR.y - sTL.y - fs) * 0.5f;
+        float fs = std::max(10.f, 13.f*st.graphZoom);
+        float tx = sTL.x + barW + 6*st.graphZoom;
+        float ty = sTL.y + (sBR.y - sTL.y - fs)*0.5f;
         ImU32 tcol = isHidden ? IM_COL32(110,110,110,(int)(255*alpha))
                               : IM_COL32(215,215,225,(int)(255*alpha));
-        std::string lbl = (pit != st.presets.end() && !pit->second.displayName.empty())
+        std::string lbl = (pit!=st.presets.end() && !pit->second.displayName.empty())
                           ? pit->second.displayName : name;
         dl->AddText(nullptr, fs, {tx, ty}, tcol, lbl.c_str());
 
-        // Tooltip
         if (hovered) {
             ImGui::BeginTooltip();
             ImGui::TextColored(ImColor(kindCol), "[%s]", KindLabel(kind));
             ImGui::SameLine(); ImGui::Text(" %s", name.c_str());
             if (pit != st.presets.end()) {
-                if (!pit->second.displayName.empty())
-                    ImGui::TextDisabled("%s", pit->second.displayName.c_str());
+                if (!pit->second.displayName.empty()) ImGui::TextDisabled("%s", pit->second.displayName.c_str());
                 if (pit->second.hidden) ImGui::TextDisabled("(hidden)");
                 ImGui::TextDisabled("Source: %s", pit->second.sourceFile.c_str());
                 if (!pit->second.inherits.empty()) {
                     ImGui::Text("Inherits:");
-                    for (auto& inh : pit->second.inherits)
-                        ImGui::BulletText("%s", inh.c_str());
+                    for (auto& inh : pit->second.inherits) ImGui::BulletText("%s", inh.c_str());
                 }
             }
             ImGui::EndTooltip();
@@ -650,7 +844,6 @@ static void DrawGraphTab(AppState& st) {
         }
     }
 
-    // Drag
     if (!st.graphDragging.empty()) {
         if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
             auto it = st.graphNodes.find(st.graphDragging);
@@ -658,45 +851,166 @@ static void DrawGraphTab(AppState& st) {
                 it->second.pos.x += io.MouseDelta.x / st.graphZoom;
                 it->second.pos.y += io.MouseDelta.y / st.graphZoom;
             }
-        } else {
-            st.graphDragging.clear();
-        }
+        } else st.graphDragging.clear();
     }
 
-    // Select / deselect
     if (!clickedNode.empty()) {
         st.selected = clickedNode;
         st.resolvedText = BuildResolvedText(clickedNode, st);
     }
     if (inCanvas && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && clickedNode.empty() && st.graphDragging.empty()) {
-        st.selected.clear();
-        st.resolvedText.clear();
+        st.selected.clear(); st.resolvedText.clear();
     }
 
     // Legend
     {
-        ImVec2 lp = {origin.x + 12, origin.y + cSize.y - 26};
-        for (auto k : {PresetKind::Configure, PresetKind::Build, PresetKind::Test,
-                       PresetKind::Package, PresetKind::Workflow}) {
-            dl->AddRectFilled(lp, {lp.x+10, lp.y+10}, KindColor(k), 2.0f);
-            dl->AddText({lp.x+14, lp.y-2}, IM_COL32(170,170,180,255), KindLabel(k));
+        ImVec2 lp = {origin.x+12, origin.y+cSize.y-26};
+        for (auto k : {PresetKind::Configure,PresetKind::Build,PresetKind::Test,
+                       PresetKind::Package,PresetKind::Workflow}) {
+            dl->AddRectFilled(lp, {lp.x+10,lp.y+10}, KindColor(k), 2);
+            dl->AddText({lp.x+14,lp.y-2}, IM_COL32(170,170,180,255), KindLabel(k));
             lp.x += ImGui::CalcTextSize(KindLabel(k)).x + 28;
         }
     }
-
     ImGui::EndChild();
 
-    // Side detail panel
     if (!st.selected.empty()) {
         ImGui::SameLine();
         ImGui::BeginChild("graph_detail", {detailW, 0}, ImGuiChildFlags_Borders);
-        if (ImGui::Button("Copy##gd"))
-            ImGui::SetClipboardText(st.resolvedText.c_str());
+        if (ImGui::Button("Copy##gd")) ImGui::SetClipboardText(st.resolvedText.c_str());
         ImGui::Separator();
-        ImGui::TextUnformatted(st.resolvedText.c_str(),
-                               st.resolvedText.c_str() + st.resolvedText.size());
+        ImGui::TextUnformatted(st.resolvedText.c_str(), st.resolvedText.c_str()+st.resolvedText.size());
         ImGui::EndChild();
     }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  GUI — Diff tab
+// ═══════════════════════════════════════════════════════════════
+
+static void DrawDiffTab(AppState& st) {
+    if (st.presetNames.empty()) {
+        ImGui::TextDisabled("Load a preset file first.");
+        return;
+    }
+
+    // Combo boxes for left and right
+    ImGui::Text("Left:");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(300);
+    const char* leftPreview = (st.diffLeft >= 0 && st.diffLeft < (int)st.presetNames.size())
+                              ? st.presetNames[st.diffLeft].c_str() : "<select preset>";
+    if (ImGui::BeginCombo("##diffleft", leftPreview)) {
+        for (int i = 0; i < (int)st.presetNames.size(); ++i) {
+            bool sel = (i == st.diffLeft);
+            if (ImGui::Selectable((st.presetNames[i] + "##dl" + std::to_string(i)).c_str(), sel))
+                st.diffLeft = i;
+        }
+        ImGui::EndCombo();
+    }
+
+    ImGui::SameLine();
+    ImGui::Text("  Right:");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(300);
+    const char* rightPreview = (st.diffRight >= 0 && st.diffRight < (int)st.presetNames.size())
+                               ? st.presetNames[st.diffRight].c_str() : "<select preset>";
+    if (ImGui::BeginCombo("##diffright", rightPreview)) {
+        for (int i = 0; i < (int)st.presetNames.size(); ++i) {
+            bool sel = (i == st.diffRight);
+            if (ImGui::Selectable((st.presetNames[i] + "##dr" + std::to_string(i)).c_str(), sel))
+                st.diffRight = i;
+        }
+        ImGui::EndCombo();
+    }
+
+    ImGui::SameLine();
+    if (ImGui::Button("Swap")) { std::swap(st.diffLeft, st.diffRight); }
+
+    if (st.diffLeft < 0 || st.diffRight < 0 ||
+        st.diffLeft >= (int)st.presetNames.size() ||
+        st.diffRight >= (int)st.presetNames.size()) {
+        ImGui::TextDisabled("Select two presets to compare.");
+        return;
+    }
+
+    if (st.diffLeft == st.diffRight) {
+        ImGui::TextColored({1, 0.8f, 0.3f, 1}, "Both sides are the same preset.");
+    }
+
+    ImGui::Separator();
+
+    std::vector<DiffLine> leftLines, rightLines;
+    BuildDiffLines(st.presetNames[st.diffLeft], st.presetNames[st.diffRight], st, leftLines, rightLines);
+
+    // Summary
+    int added = 0, removed = 0, changed = 0, same = 0;
+    for (size_t i = 0; i < leftLines.size(); ++i) {
+        switch (leftLines[i].status) {
+            case 0: same++; break;
+            case -1: removed++; break;
+            case 1: added++; break;
+            case 2: changed++; break;
+        }
+    }
+    ImGui::TextColored({0.5f, 0.5f, 0.5f, 1.0f}, "%d same", same);
+    ImGui::SameLine();
+    ImGui::TextColored({0.3f, 1.0f, 0.3f, 1.0f}, "  %d added", added);
+    ImGui::SameLine();
+    ImGui::TextColored({1.0f, 0.3f, 0.3f, 1.0f}, "  %d removed", removed);
+    ImGui::SameLine();
+    ImGui::TextColored({1.0f, 0.8f, 0.3f, 1.0f}, "  %d changed", changed);
+
+    // Side by side panels
+    float halfW = ImGui::GetContentRegionAvail().x * 0.5f - 4;
+
+    // Left header
+    ImGui::BeginChild("diff_left", {halfW, 0}, ImGuiChildFlags_Borders);
+    ImGui::TextColored({0.6f, 0.8f, 1.0f, 1.0f}, "%s", st.presetNames[st.diffLeft].c_str());
+    ImGui::Separator();
+
+    for (size_t i = 0; i < leftLines.size(); ++i) {
+        auto& ln = leftLines[i];
+        ImVec4 col;
+        switch (ln.status) {
+            case 0:  col = {0.7f, 0.7f, 0.7f, 1.0f}; break;
+            case -1: col = {1.0f, 0.4f, 0.4f, 1.0f}; break;
+            case 1:  col = {0.4f, 0.4f, 0.4f, 0.5f}; break;
+            case 2:  col = {1.0f, 0.8f, 0.3f, 1.0f}; break;
+            default: col = {0.7f, 0.7f, 0.7f, 1.0f};
+        }
+        if (ln.text.empty()) {
+            ImGui::TextColored(col, " ");
+        } else {
+            ImGui::TextColored(col, "%s", ln.text.c_str());
+        }
+    }
+    ImGui::EndChild();
+
+    ImGui::SameLine();
+
+    // Right
+    ImGui::BeginChild("diff_right", {halfW, 0}, ImGuiChildFlags_Borders);
+    ImGui::TextColored({0.6f, 0.8f, 1.0f, 1.0f}, "%s", st.presetNames[st.diffRight].c_str());
+    ImGui::Separator();
+
+    for (size_t i = 0; i < rightLines.size(); ++i) {
+        auto& ln = rightLines[i];
+        ImVec4 col;
+        switch (ln.status) {
+            case 0:  col = {0.7f, 0.7f, 0.7f, 1.0f}; break;
+            case 1:  col = {0.4f, 1.0f, 0.4f, 1.0f}; break;
+            case -1: col = {0.4f, 0.4f, 0.4f, 0.5f}; break;
+            case 2:  col = {1.0f, 0.8f, 0.3f, 1.0f}; break;
+            default: col = {0.7f, 0.7f, 0.7f, 1.0f};
+        }
+        if (ln.text.empty()) {
+            ImGui::TextColored(col, " ");
+        } else {
+            ImGui::TextColored(col, "%s", ln.text.c_str());
+        }
+    }
+    ImGui::EndChild();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -710,11 +1024,18 @@ static void DrawUI(AppState& st) {
     ImGui::Begin("CMake Preset Viewer", nullptr,
                  ImGuiWindowFlags_NoTitleBar  | ImGuiWindowFlags_NoResize |
                  ImGuiWindowFlags_NoMove      | ImGuiWindowFlags_NoCollapse |
-                 ImGuiWindowFlags_NoBringToFrontOnFocus);
+                 ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_MenuBar);
+
+    DrawMenuBar(st);
+
+    // Keyboard shortcut: Ctrl+O
+    ImGuiIO& io = ImGui::GetIO();
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O))
+        OpenFileDialog(st);
 
     // Top bar
     ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 80);
-    bool enter = ImGui::InputTextWithHint("##path", "Path to CMakePresets.json",
+    bool enter = ImGui::InputTextWithHint("##path", "Path to CMakePresets.json (or drag-and-drop a file)",
                                            st.pathBuf, sizeof(st.pathBuf),
                                            ImGuiInputTextFlags_EnterReturnsTrue);
     ImGui::SameLine();
@@ -731,8 +1052,9 @@ static void DrawUI(AppState& st) {
 
     // Tabs
     if (ImGui::BeginTabBar("MainTabs")) {
-        if (ImGui::BeginTabItem("Presets"))           { st.activeTab = 0; DrawPresetsTab(st); ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("Inheritance Graph")) { st.activeTab = 1; DrawGraphTab(st);   ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Presets"))           { DrawPresetsTab(st); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Inheritance Graph")) { DrawGraphTab(st);   ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Diff"))              { DrawDiffTab(st);    ImGui::EndTabItem(); }
         ImGui::EndTabBar();
     }
 
@@ -758,6 +1080,9 @@ int main(int argc, char* argv[]) {
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
 
+    // NFD init
+    NFD_Init();
+
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
@@ -765,12 +1090,8 @@ int main(int argc, char* argv[]) {
 
     ImGui::StyleColorsDark();
     ImGuiStyle& style = ImGui::GetStyle();
-    style.FrameRounding  = 4.0f;
-    style.GrabRounding   = 4.0f;
-    style.TabRounding    = 4.0f;
-    style.WindowRounding = 0.0f;
-    style.FramePadding   = {8, 4};
-    style.ItemSpacing    = {8, 6};
+    style.FrameRounding  = 4; style.GrabRounding = 4; style.TabRounding = 4;
+    style.WindowRounding = 0; style.FramePadding = {8, 4}; style.ItemSpacing = {8, 6};
     style.Colors[ImGuiCol_Tab]         = ImVec4(0.18f, 0.18f, 0.22f, 1.0f);
     style.Colors[ImGuiCol_TabSelected] = ImVec4(0.28f, 0.28f, 0.38f, 1.0f);
     style.Colors[ImGuiCol_TabHovered]  = ImVec4(0.32f, 0.32f, 0.45f, 1.0f);
@@ -779,10 +1100,29 @@ int main(int argc, char* argv[]) {
     ImGui_ImplOpenGL3_Init("#version 330");
 
     AppState st;
-    if (argc > 1) { snprintf(st.pathBuf, sizeof(st.pathBuf), "%s", argv[1]); LoadFile(argv[1], st); }
+    g_appState = &st;
+
+    // Set up drag-and-drop callback
+    glfwSetDropCallback(window, DropCallback);
+
+    // Load recent files
+    LoadRecentFiles(st);
+
+    // CLI arg
+    if (argc > 1) {
+        snprintf(st.pathBuf, sizeof(st.pathBuf), "%s", argv[1]);
+        LoadFile(argv[1], st);
+    }
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
+
+        // Handle deferred file load (from drag-drop or dialog)
+        if (!st.pendingLoad.empty()) {
+            LoadFile(st.pendingLoad, st);
+            st.pendingLoad.clear();
+        }
+
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
@@ -797,6 +1137,7 @@ int main(int argc, char* argv[]) {
         glfwSwapBuffers(window);
     }
 
+    NFD_Quit();
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(CMakePresetViewer LANGUAGES CXX)
+project(CMakePresetViewer LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -53,9 +53,17 @@ target_link_libraries(imgui PUBLIC glfw)
 # ── Find OpenGL ───────────────────────────────────────────────
 find_package(OpenGL REQUIRED)
 
+# ── Native File Dialog Extended ───────────────────────────────
+FetchContent_Declare(nfd
+    GIT_REPOSITORY https://github.com/btzy/nativefiledialog-extended.git
+    GIT_TAG        v1.2.1
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(nfd)
+
 # ── Our app ───────────────────────────────────────────────────
 add_executable(preset_viewer src/main.cpp)
-target_link_libraries(preset_viewer PRIVATE imgui OpenGL::GL nlohmann_json::nlohmann_json)
+target_link_libraries(preset_viewer PRIVATE imgui OpenGL::GL nlohmann_json::nlohmann_json nfd)
 
 # Hide the console window on Windows
 set_target_properties(preset_viewer PROPERTIES WIN32_EXECUTABLE $<BOOL:$<PLATFORM_ID:Windows>>)
