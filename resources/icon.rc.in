@@ -1,0 +1,2 @@
+// Windows application icon — path substituted by CMake at configure time
+IDI_ICON1 ICON "@ICON_ICO_PATH@"

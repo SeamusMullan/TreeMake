@@ -66,7 +66,14 @@ set(APP_SOURCES src/main.cpp)
 
 # Embed icon into the .exe on Windows
 if(WIN32)
-    list(APPEND APP_SOURCES resources/icon.rc)
+    # RC compiler runs from the build dir, so we need an absolute path to the .ico
+    set(ICON_ICO_PATH "${CMAKE_SOURCE_DIR}/resources/icon.ico")
+    configure_file(
+        "${CMAKE_SOURCE_DIR}/resources/icon.rc.in"
+        "${CMAKE_BINARY_DIR}/icon.rc"
+        @ONLY
+    )
+    list(APPEND APP_SOURCES "${CMAKE_BINARY_DIR}/icon.rc")
 endif()
 
 add_executable(treemake ${APP_SOURCES})
