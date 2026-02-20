@@ -15,16 +15,26 @@ jobs:
         include:
           - os: ubuntu-22.04
             name: linux
-            artifact: preset_viewer
+            artifact: treemake
           - os: windows-latest
             name: windows
-            artifact: preset_viewer.exe
+            artifact: treemake.exe
 
     runs-on: ${{ matrix.os }}
     name: Build (${{ matrix.name }})
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Generate icon assets
+        run: |
+          pip install pillow cairosvg
+          python scripts/generate_icons.py
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -51,20 +61,20 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           mkdir -p dist
-          cp build/preset_viewer dist/
-          chmod +x dist/preset_viewer
+          cp build/treemake dist/
+          chmod +x dist/treemake
 
       - name: Prepare artifact (Windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
           mkdir -p dist
-          cp build/Release/preset_viewer.exe dist/
+          cp build/Release/treemake.exe dist/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: preset-viewer-${{ matrix.name }}
+          name: treemake-${{ matrix.name }}
           path: dist/
           retention-days: 30
 
@@ -84,15 +94,15 @@ jobs:
 
       - name: Package release archives
         run: |
-          cd artifacts/preset-viewer-linux
-          tar czf ../../preset-viewer-linux-x64.tar.gz .
-          cd ../preset-viewer-windows
-          zip -r ../../preset-viewer-windows-x64.zip .
+          cd artifacts/treemake-linux
+          tar czf ../../treemake-linux-x64.tar.gz .
+          cd ../treemake-windows
+          zip -r ../../treemake-windows-x64.zip .
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           files: |
-            preset-viewer-linux-x64.tar.gz
-            preset-viewer-windows-x64.zip
+            treemake-linux-x64.tar.gz
+            treemake-windows-x64.zip

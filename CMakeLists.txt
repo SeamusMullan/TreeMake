@@ -62,8 +62,15 @@ FetchContent_Declare(nfd
 FetchContent_MakeAvailable(nfd)
 
 # ── Our app ───────────────────────────────────────────────────
-add_executable(preset_viewer src/main.cpp)
-target_link_libraries(preset_viewer PRIVATE imgui OpenGL::GL nlohmann_json::nlohmann_json nfd)
+set(APP_SOURCES src/main.cpp)
+
+# Embed icon into the .exe on Windows
+if(WIN32)
+    list(APPEND APP_SOURCES resources/icon.rc)
+endif()
+
+add_executable(treemake ${APP_SOURCES})
+target_link_libraries(treemake PRIVATE imgui OpenGL::GL nlohmann_json::nlohmann_json nfd)
 
 # Hide the console window on Windows
-set_target_properties(preset_viewer PROPERTIES WIN32_EXECUTABLE $<BOOL:$<PLATFORM_ID:Windows>>)
+set_target_properties(treemake PROPERTIES WIN32_EXECUTABLE $<BOOL:$<PLATFORM_ID:Windows>>)

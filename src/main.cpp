@@ -6,6 +6,8 @@
 #include <nlohmann/json.hpp>
 #include <nfd.h>
 
+#include "icon_data.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -111,12 +113,12 @@ static AppState* g_appState = nullptr;
 static fs::path GetRecentFilePath() {
 #ifdef _WIN32
     const char* appdata = std::getenv("APPDATA");
-    if (appdata) return fs::path(appdata) / "CMakePresetViewer" / "recent.txt";
-    return fs::path(".") / ".cmake_preset_viewer_recent";
+    if (appdata) return fs::path(appdata) / "TreeMake" / "recent.txt";
+    return fs::path(".") / ".treemake_recent";
 #else
     const char* home = std::getenv("HOME");
-    if (home) return fs::path(home) / ".config" / "cmake-preset-viewer" / "recent.txt";
-    return fs::path(".") / ".cmake_preset_viewer_recent";
+    if (home) return fs::path(home) / ".config" / "treemake" / "recent.txt";
+    return fs::path(".") / ".treemake_recent";
 #endif
 }
 
@@ -1021,7 +1023,7 @@ static void DrawUI(AppState& st) {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->WorkPos);
     ImGui::SetNextWindowSize(vp->WorkSize);
-    ImGui::Begin("CMake Preset Viewer", nullptr,
+    ImGui::Begin("TreeMake", nullptr,
                  ImGuiWindowFlags_NoTitleBar  | ImGuiWindowFlags_NoResize |
                  ImGuiWindowFlags_NoMove      | ImGuiWindowFlags_NoCollapse |
                  ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_MenuBar);
@@ -1075,10 +1077,17 @@ int main(int argc, char* argv[]) {
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 #endif
 
-    GLFWwindow* window = glfwCreateWindow(1400, 800, "CMake Preset Viewer", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(1400, 800, "TreeMake", nullptr, nullptr);
     if (!window) { fprintf(stderr, "Failed to create window\n"); glfwTerminate(); return 1; }
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
+
+    // Set window icon from embedded pixel data
+    GLFWimage icon;
+    icon.width  = ICON_WIDTH;
+    icon.height = ICON_HEIGHT;
+    icon.pixels = (unsigned char*)ICON_RGBA;
+    glfwSetWindowIcon(window, 1, &icon);
 
     // NFD init
     NFD_Init();
@@ -1150,7 +1159,7 @@ int main(int argc, char* argv[]) {
 #include <windows.h>
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR lpCmdLine, int) {
     int argc = 1;
-    char* argv[2] = { (char*)"preset_viewer", nullptr };
+    char* argv[2] = { (char*)"treemake", nullptr };
     if (lpCmdLine && lpCmdLine[0]) { argv[1] = lpCmdLine; argc = 2; }
     return main(argc, argv);
 }
