@@ -28,8 +28,10 @@ All library dependencies (Dear ImGui, GLFW, nlohmann/json) are fetched automatic
 
 ## Build
 
+I recommend using Ninja for a faster build time, but it's not necessary.
+
 ```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 ```
 
