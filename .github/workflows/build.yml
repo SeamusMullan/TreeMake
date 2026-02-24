@@ -52,6 +52,7 @@ jobs:
         run: |
           mkdir -p dist
           cp build/treemake dist/
+          strip dist/treemake
           chmod +x dist/treemake
 
       - name: Prepare artifact (Windows)
