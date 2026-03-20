@@ -101,6 +101,10 @@ struct AppState {
 
     // Pending file load (from drag-drop or dialog, deferred to main loop)
     std::string                          pendingLoad;
+
+    // UI scaling
+    float                                uiScale = 1.0f;
+    bool                                 needFontRebuild = false;
 };
 
 // Global pointer for GLFW callbacks
@@ -140,6 +144,46 @@ static void SaveRecentFiles(const AppState& st) {
     fs::create_directories(path.parent_path(), ec);
     std::ofstream f(path);
     for (auto& p : st.recentFiles) f << p << "\n";
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Settings (UI scale, etc.)
+// ═══════════════════════════════════════════════════════════════
+
+static constexpr float kUIScaleMin = 0.75f;
+static constexpr float kUIScaleMax = 2.5f;
+
+static fs::path GetSettingsPath() {
+#ifdef _WIN32
+    const char* appdata = std::getenv("APPDATA");
+    if (appdata) return fs::path(appdata) / "TreeMake" / "settings.txt";
+    return fs::path(".") / ".treemake_settings";
+#else
+    const char* home = std::getenv("HOME");
+    if (home) return fs::path(home) / ".config" / "treemake" / "settings.txt";
+    return fs::path(".") / ".treemake_settings";
+#endif
+}
+
+static void LoadSettings(AppState& st) {
+    auto path = GetSettingsPath();
+    std::ifstream f(path);
+    if (!f) return;
+    std::string key;
+    while (f >> key) {
+        if (key == "uiScale") {
+            float val;
+            if (f >> val) st.uiScale = std::clamp(val, kUIScaleMin, kUIScaleMax);
+        }
+    }
+}
+
+static void SaveSettings(const AppState& st) {
+    auto path = GetSettingsPath();
+    std::error_code ec;
+    fs::create_directories(path.parent_path(), ec);
+    std::ofstream f(path);
+    if (f) f << "uiScale " << st.uiScale << "\n";
 }
 
 static void AddToRecent(AppState& st, const std::string& filePath) {
@@ -559,6 +603,31 @@ static void BuildGraphLayout(AppState& st) {
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  UI scaling
+// ═══════════════════════════════════════════════════════════════
+
+static void ApplyUIScale(AppState& st) {
+    ImGuiIO& io = ImGui::GetIO();
+    io.Fonts->Clear();
+    ImFontConfig cfg;
+    cfg.SizePixels = std::round(13.0f * st.uiScale);
+    io.Fonts->AddFontDefault(&cfg);
+    io.Fonts->Build();
+    ImGui_ImplOpenGL3_CreateFontsTexture();
+
+    ImGui::StyleColorsDark();
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.FrameRounding  = 4; style.GrabRounding = 4; style.TabRounding = 4;
+    style.WindowRounding = 0; style.FramePadding = {8, 4}; style.ItemSpacing = {8, 6};
+    style.Colors[ImGuiCol_Tab]         = ImVec4(0.18f, 0.18f, 0.22f, 1.0f);
+    style.Colors[ImGuiCol_TabSelected] = ImVec4(0.28f, 0.28f, 0.38f, 1.0f);
+    style.Colors[ImGuiCol_TabHovered]  = ImVec4(0.32f, 0.32f, 0.45f, 1.0f);
+    style.ScaleAllSizes(st.uiScale);
+
+    st.needFontRebuild = false;
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  GUI — Menu bar
 // ═══════════════════════════════════════════════════════════════
 
@@ -595,6 +664,23 @@ static void DrawMenuBar(AppState& st) {
                 // Will be handled by GLFW
                 if (auto* win = glfwGetCurrentContext())
                     glfwSetWindowShouldClose(win, GLFW_TRUE);
+            }
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("View")) {
+            ImGui::SeparatorText("UI Scale");
+            static const float kScales[] = {0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f, 2.25f, 2.5f};
+            for (float s : kScales) {
+                char label[16];
+                snprintf(label, sizeof(label), "%d%%", (int)(s * 100));
+                bool selected = (std::abs(st.uiScale - s) < 0.01f);
+                if (ImGui::MenuItem(label, nullptr, selected)) {
+                    if (!selected) {
+                        st.uiScale = s;
+                        st.needFontRebuild = true;
+                        SaveSettings(st);
+                    }
+                }
             }
             ImGui::EndMenu();
         }
@@ -1073,6 +1159,7 @@ int main(int argc, char* argv[]) {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
 #ifdef __APPLE__
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 #endif
@@ -1097,19 +1184,16 @@ int main(int argc, char* argv[]) {
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
-    ImGui::StyleColorsDark();
-    ImGuiStyle& style = ImGui::GetStyle();
-    style.FrameRounding  = 4; style.GrabRounding = 4; style.TabRounding = 4;
-    style.WindowRounding = 0; style.FramePadding = {8, 4}; style.ItemSpacing = {8, 6};
-    style.Colors[ImGuiCol_Tab]         = ImVec4(0.18f, 0.18f, 0.22f, 1.0f);
-    style.Colors[ImGuiCol_TabSelected] = ImVec4(0.28f, 0.28f, 0.38f, 1.0f);
-    style.Colors[ImGuiCol_TabHovered]  = ImVec4(0.32f, 0.32f, 0.45f, 1.0f);
-
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 330");
 
+    // Create AppState and load persisted settings before applying UI scale
     AppState st;
     g_appState = &st;
+    LoadSettings(st);
+
+    // Apply initial font size and style (uses st.uiScale from saved settings)
+    ApplyUIScale(st);
 
     // Set up drag-and-drop callback
     glfwSetDropCallback(window, DropCallback);
@@ -1131,6 +1215,10 @@ int main(int argc, char* argv[]) {
             LoadFile(st.pendingLoad, st);
             st.pendingLoad.clear();
         }
+
+        // Rebuild font atlas if scale changed (must happen before NewFrame)
+        if (st.needFontRebuild)
+            ApplyUIScale(st);
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
