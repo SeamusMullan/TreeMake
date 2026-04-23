@@ -62,7 +62,22 @@ FetchContent_Declare(nfd
 FetchContent_MakeAvailable(nfd)
 
 # ── Our app ───────────────────────────────────────────────────
-set(APP_SOURCES src/main.cpp)
+set(APP_SOURCES
+    src/main.cpp
+    src/types.cpp
+    src/recent_files.cpp
+    src/json_helpers.cpp
+    src/preset_loader.cpp
+    src/preset_resolve.cpp
+    src/diff.cpp
+    src/graph_layout.cpp
+    src/file_dialog.cpp
+    src/ui_draw.cpp
+    src/cmake_parser.cpp
+    src/ui_project.cpp
+    src/dep_graph.cpp
+    src/ui_options.cpp
+)
 
 # Embed icon into the .exe on Windows
 if(WIN32)
